@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
 from bs4.element import Tag
+from curl_cffi import requests as curl_requests
 
 from jobspy.linkedin.constant import (
     currencies,
@@ -22,7 +23,12 @@ from jobspy.linkedin.constant import (
     salary_range,
     upper_limit,
 )
-from jobspy.linkedin.util import criteria, is_job_remote, parse_location
+from jobspy.linkedin.util import (
+    criteria,
+    is_job_remote,
+    parse_location,
+    retry_after,
+)
 from jobspy.model import (
     Compensation,
     CompensationInterval,
@@ -33,7 +39,7 @@ from jobspy.model import (
     annual_factor,
 )
 from jobspy.util import (
-    RequestsRotating,
+    TLSRotating,
     check_status,
     create_session,
     description_fields,
@@ -44,30 +50,38 @@ from jobspy.util import (
 
 class LinkedIn(Scraper):
     base_url = "https://www.linkedin.com"
-    delay = (3, 7)
+    delay = (2.5, 4.5)
+    """Seconds between any two requests, search pages and job pages alike"""
+    retry_statuses = frozenset({429, 500, 502, 503, 504})
+    max_retries = 4
+    backoff = 5.0
+    """The first wait after a 429, doubled for each retry after it"""
+    max_wait = 120.0
+    slowdown_limit = 4.0
+    """Each 429 makes the pace 1.5 times slower, up to this; each success eases it back"""
 
     def scrape(self, scraper_input: ScraperInput) -> list[JobPost]:
         self.scraper_input = scraper_input
+        # A browser's TLS fingerprint and kept cookies: LinkedIn throttles a client that
+        # looks new on every request sooner than one that looks like a returning browser.
         self.session = create_session(
-            RequestsRotating(scraper_input.proxies, clear_cookies=True),
-            scraper_input,
-            headers,
+            TLSRotating(scraper_input.proxies), scraper_input, headers
         )
+        self.next_request = 0.0
+        self.slowdown = 1.0
         for name in ("is_remote", "job_type"):
             if getattr(scraper_input, name):
                 self.warn(f"{name} isn't supported, ignoring it")
         params = self._search_params()
         job_list: list[JobPost] = []
         seen = set()
-        first_start = start = scraper_input.offset
+        start = scraper_input.offset
         page = 1
 
         while len(job_list) < scraper_input.results_wanted and start < max_results:
-            if start > first_start:
-                time.sleep(random.uniform(*self.delay))
             self.log.info(f"search page: {page}")
             try:
-                response = self.session.get(
+                response = self._get(
                     f"{self.base_url}/jobs-guest/jobs/api/seeMoreJobPostings/search",
                     params={**params, "start": start},
                 )
@@ -110,6 +124,40 @@ class LinkedIn(Scraper):
             page += 1
 
         return job_list
+
+    def _get(
+        self, url: str, params: dict[str, str | int] | None = None
+    ) -> curl_requests.Response:
+        """
+        A GET paced after the previous request; a 429 or a server error is retried after
+        Retry-After, or after a backoff that doubles. LinkedIn's 429 is a short burst limit
+        without a Retry-After, which a few seconds' wait clears.
+        """
+        for attempt in range(self.max_retries + 1):
+            wait = self.next_request - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+            if self.session.rotates:  # one visitor's cookies seen from many addresses
+                self.session.cookies.clear()
+            response = self.session.get(url, params=params, allow_redirects=True)
+            status = response.status_code
+            if status == 429:
+                self.slowdown = min(self.slowdown * 1.5, self.slowdown_limit)
+            elif status == 200:
+                self.slowdown = max(self.slowdown * 0.9, 1.0)
+            self.next_request = (
+                time.monotonic() + random.uniform(*self.delay) * self.slowdown
+            )
+            if status not in self.retry_statuses or attempt == self.max_retries:
+                return response
+            pause = min(
+                retry_after(response.headers.get("retry-after"))
+                or self.backoff * 2**attempt * random.uniform(1, 1.5),
+                self.max_wait,
+            )
+            self.log.info(f"status {status}, retry {attempt + 1} in {pause:.0f}s")
+            self.next_request = time.monotonic() + pause
+        raise AssertionError("unreachable")
 
     def _search_params(self) -> dict[str, str | int]:
         scraper_input = self.scraper_input
@@ -212,7 +260,7 @@ class LinkedIn(Scraper):
         The job page's description, pay, logo and criteria; empty when the page can't be read
         """
         try:
-            response = self.session.get(f"{self.base_url}/jobs/view/{job_id}")
+            response = self._get(f"{self.base_url}/jobs/view/{job_id}")
             check_status(response)
         except Exception as e:
             self.warn(f"job {job_id}: {e}")

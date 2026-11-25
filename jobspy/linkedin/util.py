@@ -49,3 +49,11 @@ def parse_location(text: str) -> Location:
         return Location(country=text)
     except ValueError:
         return Location(city=text)
+
+
+def retry_after(value: str | None) -> float | None:
+    """Seconds from a Retry-After header in seconds; None when absent or a date"""
+    try:
+        return max(float(value), 0.0) if value else None
+    except ValueError:
+        return None

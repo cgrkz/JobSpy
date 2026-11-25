@@ -115,7 +115,7 @@ Optional
 ├── proxies (list|str): 
 |    in format ['user:pass@host:port', 'localhost'], or a single proxy as a string
 |    each job board scraper will round robin through the proxies
-|    socks proxies on LinkedIn, Indeed and BDJobs need pip install "requests[socks]"
+|    socks proxies on Indeed and BDJobs need pip install "requests[socks]"
 |
 ├── is_remote (bool)
 │
@@ -241,7 +241,7 @@ BDJobs searches Bangladesh. `location` takes a division or district, e.g. `"Dhak
 * Indeed is the best scraper currently with no rate limiting.  
 * Indeed's `date_posted` is the day a job was added to Indeed, the same date `hours_old` filters on.  
 * Most job board endpoints are capped at around 1000 jobs on a given search.  
-* LinkedIn rate limits bursts of requests with a 429, which clears within about a minute. Use proxies for larger searches.
+* LinkedIn rate limits bursts of requests with a 429 that clears within seconds. The scraper paces its requests 2.5–4.5 s apart and retries a 429 after 5, 10, 20 and 40 s, so a search is slower but runs to the end; tune `LinkedIn.delay`, `LinkedIn.max_retries` and `LinkedIn.backoff` if needed. Proxies still help for larger searches.
 * Glassdoor rate limits above about 2 requests a second.
 
 ## Frequently Asked Questions
